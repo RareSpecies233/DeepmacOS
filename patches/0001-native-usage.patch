@@ -1,0 +1,44 @@
+diff --git a/src/services/api/client.ts b/src/services/api/client.ts
+index d2d2e28..80e9147 100644
+--- a/src/services/api/client.ts
++++ b/src/services/api/client.ts
+@@ -1,12 +1,14 @@
+ import { translate, type TranslationMessage } from '../../i18n/index.js'
+ import { readMessageEvent } from './parseEvent.js'
+ import { readServerSentEvents } from './sse.js'
++import { reportUsage } from './native.js'
+ import type {
+   ApiErrorBody,
+   CreateMessageRequest,
+   FileObject,
+   FilePurpose,
+   MessageStreamEvent,
++  MessageUsage,
+ } from './types.js'
+ 
+ /** 构建期 API 地址，默认 https://api.deepseek.com；本地开发支持开发服务器代理 */
+@@ -160,6 +162,8 @@ export async function* streamMessage(
+   if (!response.body || !contentType.includes('text/event-stream')) {
+     throw await readErrorResponse(response, 'protocol', '')
+   }
++  // 桌面壳用量账本：message_start 给初始值，message_delta 给全轮累计值
++  let usage: MessageUsage | null = null
+   for await (const { event: eventName, data } of readServerSentEvents(response.body, signal)) {
+     let payload: unknown
+     try {
+@@ -179,8 +183,15 @@ export async function* streamMessage(
+     if (!event) {
+       continue
+     }
++    if (event.type === 'message_start' && event.message.usage) {
++      usage = event.message.usage
++    }
++    if (event.type === 'message_delta' && event.usage) {
++      usage = event.usage
++    }
+     yield event
+     if (event.type === 'message_stop') {
++      reportUsage({ model: body.model, usage: usage ?? undefined })
+       return
+     }
+   }
