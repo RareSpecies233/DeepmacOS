@@ -4,3 +4,4 @@ web/
 Resources/AppIcon.iconset/
 Resources/AppIcon-1024.png
 .DS_Store
+vendor/chat-demo
