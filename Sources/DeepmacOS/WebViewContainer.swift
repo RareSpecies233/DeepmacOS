@@ -17,9 +17,32 @@ struct WebViewContainer: NSViewRepresentable {
 
         let controller = WKUserContentController()
         controller.add(context.coordinator, name: "deepmacos")
+        let glass = model.usesGlass ? "el.classList.add('deepmacos-glass');" : ""
+        let flags = """
+        (function () {
+          var apply = function () {
+            var el = document.documentElement;
+            if (!el) return false;
+            el.classList.add('deepmacos-titlebar-inset');
+            \(glass)
+            return true;
+          };
+          if (!apply()) document.addEventListener('DOMContentLoaded', apply);
+        })();
+        """
         controller.addUserScript(WKUserScript(
-            source: "window.__deepmacos = { version: '0.1.0' };",
+            source: "window.__deepmacos = { version: '0.2.0' };",
             injectionTime: .atDocumentStart,
+            forMainFrameOnly: true
+        ))
+        controller.addUserScript(WKUserScript(
+            source: flags,
+            injectionTime: .atDocumentStart,
+            forMainFrameOnly: true
+        ))
+        controller.addUserScript(WKUserScript(
+            source: WebCoordinator.dragZonesScript,
+            injectionTime: .atDocumentEnd,
             forMainFrameOnly: true
         ))
         config.userContentController = controller
@@ -42,6 +65,108 @@ struct WebViewContainer: NSViewRepresentable {
             webView.load(URLRequest(url: url))
         }
     }
+}
+
+extension WebCoordinator {
+    /// 计算顶栏可拖拽区域（排除按钮），归一化后交给原生做窗口拖动
+    static let dragZonesScript = #"""
+    (function () {
+      if (window.__deepmacosZonesInstalled) { window.__deepmacosCollectZones && window.__deepmacosCollectZones(); return; }
+      window.__deepmacosZonesInstalled = true;
+
+      function bands(el) {
+        var r = el.getBoundingClientRect();
+        if (!r.width || !r.height) return [];
+        var holes = Array.prototype.slice.call(el.querySelectorAll('button,[role="button"],a,input,textarea,select'))
+          .map(function (b) { return b.getBoundingClientRect(); })
+          .filter(function (b) { return b.width > 0 && b.bottom > r.top && b.top < r.bottom; })
+          .sort(function (a, b) { return a.left - b.left; });
+        var out = [], x = r.left;
+        for (var i = 0; i < holes.length; i++) {
+          var h = holes[i];
+          if (h.left > x) {
+            var w = Math.min(h.left, r.right) - x;
+            if (w > 4) out.push([x, r.top, w, r.height]);
+          }
+          x = Math.max(x, h.right);
+        }
+        if (x < r.right - 1) out.push([x, r.top, r.right - x, r.height]);
+        return out;
+      }
+
+      function collect() {
+        var zones = [];
+        var roots = [];
+        var siderTop = document.querySelector('[class*="sider"] > [class*="top"]');
+        if (siderTop) roots.push(siderTop);
+        var viewHeader = document.querySelector('[class*="view"] > [class*="header"]');
+        if (viewHeader) roots.push(viewHeader);
+        var push = function (x, y, w, h) {
+          zones.push({
+            x: x / window.innerWidth,
+            y: y / window.innerHeight,
+            w: w / window.innerWidth,
+            h: h / window.innerHeight
+          });
+        };
+        roots.forEach(function (el) {
+          bands(el).forEach(function (b) { push(b[0], b[1], b[2], b[3]); });
+        });
+
+        // 主区域顶部通用拖拽带（欢迎页没有 header 时也能拖），自动排除按钮
+        var sider = document.querySelector('.deepmacos-sider');
+        var topBand = 48;
+        var startX = sider ? sider.getBoundingClientRect().right : 0;
+        var holes = Array.prototype.slice
+          .call(document.querySelectorAll('button,[role="button"],a,input,textarea,select'))
+          .map(function (b) { return b.getBoundingClientRect(); })
+          .filter(function (b) { return b.width > 0 && b.top < topBand && b.bottom > 0 && b.right > startX; })
+          .sort(function (a, b) { return a.left - b.left; });
+        var cursor = startX;
+        holes.forEach(function (h) {
+          if (h.left > cursor) push(cursor, 0, Math.min(h.left, window.innerWidth) - cursor, topBand);
+          cursor = Math.max(cursor, h.right);
+        });
+        if (cursor < window.innerWidth - 1) push(cursor, 0, window.innerWidth - cursor, topBand);
+        window.__deepmacosZones = zones;
+        var avoid = Array.prototype.slice
+          .call(document.querySelectorAll('button,[role="button"],a,input,textarea,select,[contenteditable="true"]'))
+          .map(function (el) { return el.getBoundingClientRect(); })
+          .filter(function (r) { return r.width > 0 && r.height > 0; })
+          .map(function (r) {
+            return {
+              x: r.left / window.innerWidth,
+              y: r.top / window.innerHeight,
+              w: r.width / window.innerWidth,
+              h: r.height / window.innerHeight
+            };
+          });
+        window.__deepmacosAvoid = avoid;
+        var headerEl = document.querySelector('[class*="sider"] > [class*="top"]');
+        var header = null;
+        if (headerEl) {
+          var hr = headerEl.getBoundingClientRect();
+          header = {
+            x: hr.left / window.innerWidth,
+            y: hr.top / window.innerHeight,
+            w: hr.width / window.innerWidth,
+            h: hr.height / window.innerHeight
+          };
+        }
+        try {
+          window.webkit.messageHandlers.deepmacos.postMessage({ type: 'dragZones', zones: zones, avoid: avoid, header: header });
+        } catch (e) {}
+      }
+
+      window.__deepmacosCollectZones = collect;
+      requestAnimationFrame(function () { collect(); setTimeout(collect, 400); });
+      window.addEventListener('resize', function () { setTimeout(collect, 150); });
+      new MutationObserver(function () {
+        clearTimeout(window.__deepmacosZoneTimer);
+        window.__deepmacosZoneTimer = setTimeout(collect, 250);
+      }).observe(document.body, { childList: true, subtree: true });
+    })();
+    """#
 }
 
 final class WebCoordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler, WKDownloadDelegate {
@@ -96,6 +221,16 @@ final class WebCoordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScri
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         NSLog("DeepmacOS navigation finished: %@", webView.url?.absoluteString ?? "?")
+        // SPA 重新渲染后刷新拖拽区域，并把桌面状态推给设置页
+        webView.evaluateJavaScript("window.__deepmacosCollectZones && window.__deepmacosCollectZones();",
+                                   completionHandler: nil)
+        if model?.usesGlass == true {
+            webView.evaluateJavaScript(
+                "document.documentElement.classList.add('deepmacos-titlebar-inset','deepmacos-glass');",
+                completionHandler: nil
+            )
+        }
+        model?.sendDesktopState()
     }
 
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {

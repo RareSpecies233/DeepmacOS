@@ -21,6 +21,19 @@ final class AppModel: ObservableObject {
 
     @Published var currentTitle = ""
 
+    /// 顶栏可拖拽区域（归一化坐标，左上原点）
+    @Published var dragZones: [NSRect] = []
+    /// 交互控件矩形：落在这些区域内的点击一律交还给网页，绝不触发拖窗
+    @Published var avoidZones: [NSRect] = []
+    /// 侧栏顶行（归一化）：红绿灯要对齐到这一行的中线
+    var headerBand: NSRect?
+    var onHeaderBand: ((NSRect) -> Void)?
+
+    var usesGlass: Bool {
+        if #available(macOS 26.0, *) { return true }
+        return false
+    }
+
     @Published var balance: [BalanceInfo] = []
     @Published var balanceAvailable: Bool?
     @Published var balanceUpdatedAt: Date?
@@ -31,6 +44,20 @@ final class AppModel: ObservableObject {
 
     func start() {
         guard server == nil, serverError == nil else { return }
+
+        // 单实例保护：直接跑二进制（绕过 LaunchServices）时也要避免第二个实例抢端口
+        if let bundleID = Bundle.main.bundleIdentifier {
+            let running = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID)
+            if running.contains(where: { $0.processIdentifier != getpid() }) {
+                NSLog("DeepmacOS another instance is already running; activating it")
+                running.first(where: { $0.processIdentifier != getpid() })?
+                    .activate(options: [.activateIgnoringOtherApps])
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                    NSApp.terminate(nil)
+                }
+                return
+            }
+        }
         guard let root = Self.resolveWebRoot() else {
             serverError = "找不到前端资源（web/），请先执行 make web"
             return
@@ -47,13 +74,19 @@ final class AppModel: ObservableObject {
             serverError = "本机端口都被占用，无法启动本地服务"
             return
         }
+        let savedPort = prefs.webPort
         let loopback = LoopbackServer(root: root, port: port, onReady: { [weak self] bound in
             guard let self else { return }
-            // 端口写回偏好：下次必须复用同一端口，否则 origin 变化会让本地历史"消失"
-            self.prefs.webPort = bound
+            // 只有首次启动或命中已保存端口才写回。
+            // 回退到其它端口时绝不能覆盖，否则 origin 变化会让本地历史"消失"。
+            if savedPort == 0 || bound == savedPort {
+                self.prefs.webPort = bound
+            } else {
+                NSLog("DeepmacOS fallback port %d (saved %d kept)", bound, savedPort)
+            }
             let url = URL(string: "http://127.0.0.1:\(bound)/")
             self.serverURL = url
-            NSLog("DeepmacOS serving web on %@ (port persisted)", url?.absoluteString ?? "?")
+            NSLog("DeepmacOS serving web on %@", url?.absoluteString ?? "?")
         }, onFailure: { [weak self] in
             guard let self else { return }
             self.server = nil
@@ -119,8 +152,118 @@ final class AppModel: ObservableObject {
         """)
     }
 
+    func openWebSettings() {
+        runJS("window.dispatchEvent(new CustomEvent('deepmacos:open-settings'));")
+    }
+
     func reload() {
         webView?.reload()
+    }
+
+    // MARK: - 桌面设置状态（供 web 设置页读取）
+
+    func sendDesktopState() {
+        guard let webView, webView.url != nil else { return }
+        let payload = desktopState()
+        guard let data = try? JSONSerialization.data(withJSONObject: payload),
+              let json = String(data: data, encoding: .utf8) else { return }
+        runJS("window.__deepmacosDesktopState && window.__deepmacosDesktopState(\(json));")
+        _ = webView
+    }
+
+    private func desktopState() -> [String: Any] {
+        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.2.0"
+        let infos: [[String: Any]] = balance.map {
+            [
+                "currency": $0.currency,
+                "total": $0.total_balance,
+                "granted": $0.granted_balance,
+                "toppedUp": $0.topped_up_balance,
+            ]
+        }
+        let recent: [[String: Any]] = ledger.recent.prefix(8).map { record in
+            [
+                "t": record.t,
+                "model": record.model,
+                "tokens": record.input + record.cacheWrite + record.cacheRead + record.output,
+                "cost": Pricing.cost(record),
+            ]
+        }
+        return [
+            "version": version,
+            "model": "deepseek-flash",
+            "port": Int(prefs.webPort),
+            "prefs": [
+                "hotkey": prefs.globalHotKeyEnabled,
+                "services": prefs.servicesEnabled,
+                "menuBar": prefs.menuBarEnabled,
+                "threshold": prefs.lowBalanceThreshold,
+                "currency": prefs.thresholdCurrency,
+            ],
+            "balance": [
+                "loading": balanceLoading,
+                "available": balanceAvailable.map { $0 as Any } ?? NSNull(),
+                "error": balanceError ?? NSNull(),
+                "updatedAt": balanceUpdatedAt?.timeIntervalSince1970 ?? 0,
+                "infos": infos,
+            ],
+            "usage": [
+                "today": ledger.todayCost,
+                "month": ledger.monthCost,
+                "searches": ledger.monthSearches,
+                "inTokens": ledger.todayTokens.input,
+                "outTokens": ledger.todayTokens.output,
+                "recent": recent,
+            ],
+        ]
+    }
+
+    private func handleDesktopSet(_ body: [String: Any]) {
+        guard let key = body["key"] as? String else { return }
+        let value = body["value"]
+        switch key {
+        case "hotkey":
+            prefs.globalHotKeyEnabled = (value as? Bool) ?? false
+        case "services":
+            prefs.servicesEnabled = (value as? Bool) ?? false
+        case "menuBar":
+            prefs.menuBarEnabled = (value as? Bool) ?? false
+        case "threshold":
+            if let double = value as? Double {
+                prefs.lowBalanceThreshold = double
+            } else if let int = value as? Int {
+                prefs.lowBalanceThreshold = Double(int)
+            }
+        case "currency":
+            if let currency = value as? String { prefs.thresholdCurrency = currency }
+        default:
+            break
+        }
+        sendDesktopState()
+    }
+
+    private func handleDragZones(_ body: [String: Any]) {
+        func rects(_ key: String) -> [NSRect] {
+            guard let list = body[key] as? [[String: Any]] else { return [] }
+            return list.compactMap { item in
+                guard let x = (item["x"] as? NSNumber)?.doubleValue,
+                      let y = (item["y"] as? NSNumber)?.doubleValue,
+                      let w = (item["w"] as? NSNumber)?.doubleValue,
+                      let h = (item["h"] as? NSNumber)?.doubleValue else { return nil }
+                return NSRect(x: x, y: y, width: w, height: h)
+            }
+        }
+        dragZones = rects("zones")
+        avoidZones = rects("avoid")
+        if let header = body["header"] as? [String: Any],
+           let x = (header["x"] as? NSNumber)?.doubleValue,
+           let y = (header["y"] as? NSNumber)?.doubleValue,
+           let w = (header["w"] as? NSNumber)?.doubleValue,
+           let h = (header["h"] as? NSNumber)?.doubleValue {
+            let band = NSRect(x: x, y: y, width: w, height: h)
+            headerBand = band
+            onHeaderBand?(band)
+        }
     }
 
     func zoom(delta: Double) {
@@ -183,8 +326,10 @@ final class AppModel: ObservableObject {
                 self.balanceUpdatedAt = Date()
                 self.balanceError = nil
                 self.checkLowBalance()
+                self.sendDesktopState()
             } catch {
                 self.balanceError = error.localizedDescription
+                self.sendDesktopState()
             }
         }
     }
@@ -212,6 +357,15 @@ final class AppModel: ObservableObject {
             if let title = body["title"] as? String, !title.isEmpty {
                 currentTitle = title
             }
+        case "dragZones":
+            handleDragZones(body)
+        case "desktop.get":
+            sendDesktopState()
+        case "desktop.set":
+            handleDesktopSet(body)
+        case "desktop.refreshBalance":
+            sendDesktopState()
+            refreshBalance(force: true)
         default:
             break
         }
@@ -237,6 +391,7 @@ final class AppModel: ObservableObject {
             searches: number(tools["web_search_requests"])
         )
         ledger.append(record)
+        sendDesktopState()
 
         // 窗口不在前台时提醒，并更新 Dock 角标
         if !NSApp.isActive {
@@ -293,7 +448,8 @@ final class AppModel: ObservableObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
             self?.runJS("""
             (function(){var ta=document.querySelector('textarea');if(!ta)return false;
-            ta.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true}));return true;})()
+            var fire=function(){ta.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true}));};
+            fire(); setTimeout(fire, 120); return true;})()
             """)
             NSLog("DeepmacOS selftest: message submitted")
         }
@@ -324,6 +480,39 @@ final class AppModel: ObservableObject {
         }
         return {
           title: document.title,
+          cls: document.documentElement.className,
+          zones: (window.__deepmacosZones || []).length,
+          brandHidden: (function () {
+            var el = document.querySelector('[class*="appName"]');
+            return el ? getComputedStyle(el).display : 'missing';
+          })(),
+          collapsed: !!document.querySelector('[class*="collapsed"]'),
+          buttons: Array.prototype.slice.call(document.querySelectorAll('button[aria-label]')).map(function (b) {
+            var r = b.getBoundingClientRect();
+            return [b.getAttribute('aria-label'), Math.round(r.width), Math.round(r.top)];
+          }),
+          expandSafe: (function () {
+            var btn = document.querySelector('[class*="collapsed"] button');
+            var avoid = window.__deepmacosAvoid || [];
+            if (!btn) return 'no-button';
+            var r = btn.getBoundingClientRect();
+            var cx = (r.left + r.width / 2) / window.innerWidth;
+            var cy = (r.top + r.height / 2) / window.innerHeight;
+            return avoid.some(function (a) {
+              return cx >= a.x && cx <= a.x + a.w && cy >= a.y && cy <= a.y + a.h;
+            }) ? 'avoided' : 'draggable';
+          })(),
+          buttonSafe: (function () {
+            var btn = document.querySelector('[class*="top"] button');
+            var avoid = window.__deepmacosAvoid || [];
+            if (!btn) return 'no-button';
+            var r = btn.getBoundingClientRect();
+            var cx = (r.left + r.width / 2) / window.innerWidth;
+            var cy = (r.top + r.height / 2) / window.innerHeight;
+            return avoid.some(function (a) {
+              return cx >= a.x && cx <= a.x + a.w && cy >= a.y && cy <= a.y + a.h;
+            }) ? 'avoided' : 'draggable';
+          })(),
           hasKey: !!localStorage.getItem('chat-demo:api-key'),
           sessions,
           dbs,
@@ -338,6 +527,49 @@ final class AppModel: ObservableObject {
                 NSLog("DeepmacOS probe failed: %@", error.localizedDescription)
             }
         }
+    }
+
+    func inspectSessionMenu() {
+        runJS("""
+        (function(){
+          var list = Array.prototype.slice.call(document.querySelectorAll('button[aria-label="更多"],button[aria-label="More"]'));
+          var btn = list.filter(function (b) { var r = b.getBoundingClientRect(); return r.width > 0 && r.height > 0; }).pop();
+          if (btn) {
+            var r = btn.getBoundingClientRect();
+            btn.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, clientX: r.left + r.width / 2, clientY: r.top + r.height / 2 }));
+            btn.click();
+          }
+        })()
+        """)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
+            self?.webView?.evaluateJavaScript("""
+            (function(){
+              var m = document.querySelector('[role="menu"]');
+              var a = document.querySelector('button[aria-label="更多"]');
+              return JSON.stringify({
+                style: m ? m.getAttribute('style') : null,
+                menu: m ? m.getBoundingClientRect().toJSON() : null,
+                anchor: a ? a.getBoundingClientRect().toJSON() : null,
+                vw: innerWidth, vh: innerHeight,
+                zoom: window.visualViewport ? window.visualViewport.scale : null
+              });
+            })()
+            """) { value, error in
+                NSLog("DeepmacOS menuProbe: %@ err=%@", String(describing: value), error?.localizedDescription ?? "none")
+            }
+        }
+    }
+
+    func openSessionMenu() {
+        runJS("""
+        (function(){
+          var btn = document.querySelector('button[aria-label="更多"]') || document.querySelector('button[aria-label="More"]');
+          if (btn) { btn.click(); return true; }
+          var item = document.querySelector('[class*="title"]');
+          if (item && item.parentElement) { item.parentElement.dispatchEvent(new MouseEvent('contextmenu', {bubbles:true, cancelable:true})); return true; }
+          return false;
+        })()
+        """)
     }
 
     func runDownloadTest() {
